@@ -1,4 +1,8 @@
 {
+	# Браузеры не шлют SNI при заходе по IP, а внутри Docker Caddy видит адрес контейнера,
+	# а не публичный IP. Без этой строки сертификат не находится и TLS-рукопожатие падает.
+	default_sni {$SITE_ADDRESS}
+
 	# Let's Encrypt выдаёт сертификаты на IP-адреса только по профилю shortlived (6 дней, продлевается сам)
 	cert_issuer acme {
 		profile shortlived

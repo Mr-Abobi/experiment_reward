@@ -1,0 +1,13 @@
+diff --git a/Caddyfile b/Caddyfile
+index 43334ce..fb58e55 100644
+--- a/Caddyfile
++++ b/Caddyfile
+@@ -1,4 +1,8 @@
+ {
++	# Браузеры не шлют SNI при заходе по IP, а внутри Docker Caddy видит адрес контейнера,
++	# а не публичный IP. Без этой строки сертификат не находится и TLS-рукопожатие падает.
++	default_sni {$SITE_ADDRESS}
++
+ 	# Let's Encrypt выдаёт сертификаты на IP-адреса только по профилю shortlived (6 дней, продлевается сам)
+ 	cert_issuer acme {
+ 		profile shortlived
