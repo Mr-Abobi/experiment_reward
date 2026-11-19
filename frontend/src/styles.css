@@ -398,7 +398,9 @@ body {
 }
 
 .chat-media {
-  max-width: 200px;
+  max-width: 280px;
+  max-height: 320px;
+  object-fit: cover;
   border-radius: 8px;
   margin-top: 6px;
   display: block;
@@ -849,4 +851,24 @@ body {
   color: #0d0d12;
   font-weight: 700;
   cursor: pointer;
+}
+/* ---------- Lightbox ---------- */
+.zoomable { cursor: zoom-in; }
+.lightbox {
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(0,0,0,0.92);
+  display: flex; align-items: center; justify-content: center;
+  cursor: zoom-out;
+}
+.lightbox img {
+  max-width: 95vw; max-height: 90vh; object-fit: contain;
+  border-radius: 6px; cursor: default;
+}
+.lightbox-close {
+  position: absolute; top: 16px; right: 20px;
+  background: none; border: none; color: #fff; font-size: 28px; cursor: pointer;
+}
+.lightbox-open {
+  position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
+  color: #c9a84c; font-size: 13px; text-decoration: none;
 }

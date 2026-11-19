@@ -24,7 +24,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 50 * 1024 * 1024 },
+  limits: { fileSize: 50 * 1024 * 1024, fieldSize: 10 * 1024 * 1024 }, // fieldSize — для base64-рисунков
   fileFilter: (req, file, cb) => {
     const ok = [
       'image/jpeg', 'image/png', 'image/gif', 'image/webp',
@@ -50,6 +50,23 @@ function authMiddleware(req, res, next) {
 function adminMiddleware(req, res, next) {
   if (!req.user?.is_admin) return res.status(403).json({ error: 'no admin' });
   next();
+}
+
+// Не даём упасть процессу из-за необработанной ошибки в async-хендлере (Express 4)
+process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));
+
+// Админ создаётся/обновляется при КАЖДОМ старте, поэтому не зависит от init.sql
+// (init.sql выполняется только на пустом томе pgdata).
+async function ensureAdmin() {
+  const name = process.env.ADMIN_USER || 'admin';
+  const pass = process.env.ADMIN_PASSWORD || 'admin';
+  const hash = await bcrypt.hash(pass, 10);
+  await pool.query(
+    `INSERT INTO users (username, password_hash, is_admin) VALUES ($1,$2,TRUE)
+     ON CONFLICT (username) DO UPDATE SET password_hash=EXCLUDED.password_hash, is_admin=TRUE`,
+    [name, hash]
+  );
+  console.log(`admin "${name}" ready`);
 }
 
 // ---------- AUTH ----------
@@ -308,4 +325,6 @@ app.get('/api/me', authMiddleware, async (req, res) => {
   res.json({ id: req.user.id, username: req.user.username, is_admin: req.user.is_admin });
 });
 
-app.listen(3000, () => console.log('backend up on :3000'));
+ensureAdmin()
+  .catch((e) => console.error('ensureAdmin failed (старая схема БД? сделай docker compose down -v):', e.message))
+  .finally(() => app.listen(3000, () => console.log('backend up on :3000')));

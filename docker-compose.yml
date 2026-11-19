@@ -23,6 +23,9 @@ services:
       DB_USER: postgres
       DB_PASSWORD: rewardpass
       DB_NAME: reward
+      ADMIN_USER: admin
+      ADMIN_PASSWORD: admin   # поменяй перед выкладкой в интернет
+      # JWT_SECRET: <длинная случайная строка>
     volumes:
       - ./backend/uploads:/app/uploads
     depends_on:

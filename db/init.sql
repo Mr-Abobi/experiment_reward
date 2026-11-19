@@ -61,11 +61,4 @@ CREATE TABLE settings (
 
 INSERT INTO settings (key, value) VALUES ('voting_ends_at', '2026-12-31T23:59:59');
 
--- Админ: admin / admin
--- bcrypt hash of "admin" (cost 10)
-INSERT INTO users (username, password_hash, is_admin)
-VALUES (
-  'admin',
-  '$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy',
-  TRUE
-);
+-- Админ создаётся бэкендом при старте (ensureAdmin в backend/index.js).

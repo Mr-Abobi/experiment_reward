@@ -23,6 +23,24 @@ function AttachButton({ accept, onChange, title = 'Прикрепить файл
   );
 }
 
+// Полноэкранный просмотр картинки (как в ВК): клик по фону / Esc — закрыть
+function Lightbox({ src, onClose }) {
+  useEffect(() => {
+    const onKey = (e) => e.key === 'Escape' && onClose();
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  return (
+    <div className="lightbox" onClick={onClose}>
+      <button className="lightbox-close" onClick={onClose} aria-label="Закрыть">✕</button>
+      <img src={src} alt="" onClick={(e) => e.stopPropagation()} />
+      <a className="lightbox-open" href={src} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>
+        Открыть оригинал
+      </a>
+    </div>
+  );
+}
+
 // Простая рисовалка
 function DrawingCanvas({ onSave, onCancel }) {
   const canvasRef = useRef(null);
@@ -109,6 +127,7 @@ function DrawingCanvas({ onSave, onCancel }) {
 
 export default function App() {
   const [me, setMe] = useState(null);
+  const [lightboxSrc, setLightboxSrc] = useState(null);
   const [screen, setScreen] = useState('feed');
   const [authMode, setAuthMode] = useState('login');
 
@@ -472,7 +491,7 @@ export default function App() {
                   (p.media_url.match(/\.(mp4|webm|mov)$/i) ? (
                     <video src={p.media_url} controls className="post-media" />
                   ) : (
-                    <img src={p.media_url} className="post-media" alt="" />
+                    <img src={p.media_url} className="post-media zoomable" alt="" onClick={() => setLightboxSrc(p.media_url)} />
                   ))}
               </article>
             ))}
@@ -515,7 +534,7 @@ export default function App() {
                           (m.media_url.match(/\.(mp4|webm|mov)$/i) ? (
                             <video src={m.media_url} controls className="chat-media" />
                           ) : (
-                            <img src={m.media_url} className="chat-media" alt="" />
+                            <img src={m.media_url} className="chat-media zoomable" alt="" onClick={() => setLightboxSrc(m.media_url)} />
                           ))}
                       </div>
                     ))}
@@ -625,6 +644,8 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {lightboxSrc && <Lightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
 
       {/* Post modal */}
       {showPostModal && (

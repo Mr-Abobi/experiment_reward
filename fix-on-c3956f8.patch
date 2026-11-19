@@ -1,0 +1,197 @@
+diff --git a/backend/index.js b/backend/index.js
+index fca6ac7..9d924e0 100644
+--- a/backend/index.js
++++ b/backend/index.js
+@@ -24,7 +24,7 @@ const storage = multer.diskStorage({
+ 
+ const upload = multer({
+   storage,
+-  limits: { fileSize: 50 * 1024 * 1024 },
++  limits: { fileSize: 50 * 1024 * 1024, fieldSize: 10 * 1024 * 1024 }, // fieldSize — для base64-рисунков
+   fileFilter: (req, file, cb) => {
+     const ok = [
+       'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+@@ -52,6 +52,23 @@ function adminMiddleware(req, res, next) {
+   next();
+ }
+ 
++// Не даём упасть процессу из-за необработанной ошибки в async-хендлере (Express 4)
++process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));
++
++// Админ создаётся/обновляется при КАЖДОМ старте, поэтому не зависит от init.sql
++// (init.sql выполняется только на пустом томе pgdata).
++async function ensureAdmin() {
++  const name = process.env.ADMIN_USER || 'admin';
++  const pass = process.env.ADMIN_PASSWORD || 'admin';
++  const hash = await bcrypt.hash(pass, 10);
++  await pool.query(
++    `INSERT INTO users (username, password_hash, is_admin) VALUES ($1,$2,TRUE)
++     ON CONFLICT (username) DO UPDATE SET password_hash=EXCLUDED.password_hash, is_admin=TRUE`,
++    [name, hash]
++  );
++  console.log(`admin "${name}" ready`);
++}
++
+ // ---------- AUTH ----------
+ app.post('/api/register', async (req, res) => {
+   const { username, password } = req.body;
+@@ -308,4 +325,6 @@ app.get('/api/me', authMiddleware, async (req, res) => {
+   res.json({ id: req.user.id, username: req.user.username, is_admin: req.user.is_admin });
+ });
+ 
+-app.listen(3000, () => console.log('backend up on :3000'));
+\ No newline at end of file
++ensureAdmin()
++  .catch((e) => console.error('ensureAdmin failed (старая схема БД? сделай docker compose down -v):', e.message))
++  .finally(() => app.listen(3000, () => console.log('backend up on :3000')));
+diff --git a/db/init.sql b/db/init.sql
+index 3f9cc67..0f3b7b3 100644
+--- a/db/init.sql
++++ b/db/init.sql
+@@ -61,11 +61,4 @@ CREATE TABLE settings (
+ 
+ INSERT INTO settings (key, value) VALUES ('voting_ends_at', '2026-12-31T23:59:59');
+ 
+--- Админ: admin / admin
+--- bcrypt hash of "admin" (cost 10)
+-INSERT INTO users (username, password_hash, is_admin)
+-VALUES (
+-  'admin',
+-  '$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy',
+-  TRUE
+-);
+\ No newline at end of file
++-- Админ создаётся бэкендом при старте (ensureAdmin в backend/index.js).
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 7d87d58..56036e4 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -23,6 +23,9 @@ services:
+       DB_USER: postgres
+       DB_PASSWORD: rewardpass
+       DB_NAME: reward
++      ADMIN_USER: admin
++      ADMIN_PASSWORD: admin   # поменяй перед выкладкой в интернет
++      # JWT_SECRET: <длинная случайная строка>
+     volumes:
+       - ./backend/uploads:/app/uploads
+     depends_on:
+diff --git a/frontend/nginx.conf b/frontend/nginx.conf
+index ef57dd0..66ced1d 100644
+--- a/frontend/nginx.conf
++++ b/frontend/nginx.conf
+@@ -1,7 +1,7 @@
+ server {
+     listen 80;
+     server_name _;
+-    client_max_body_size 20m;
++    client_max_body_size 55m;
+ 
+     root /usr/share/nginx/html;
+     index index.html;
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index da9ac3d..55fb50d 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -23,6 +23,24 @@ function AttachButton({ accept, onChange, title = 'Прикрепить файл
+   );
+ }
+ 
++// Полноэкранный просмотр картинки (как в ВК): клик по фону / Esc — закрыть
++function Lightbox({ src, onClose }) {
++  useEffect(() => {
++    const onKey = (e) => e.key === 'Escape' && onClose();
++    window.addEventListener('keydown', onKey);
++    return () => window.removeEventListener('keydown', onKey);
++  }, [onClose]);
++  return (
++    <div className="lightbox" onClick={onClose}>
++      <button className="lightbox-close" onClick={onClose} aria-label="Закрыть">✕</button>
++      <img src={src} alt="" onClick={(e) => e.stopPropagation()} />
++      <a className="lightbox-open" href={src} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>
++        Открыть оригинал
++      </a>
++    </div>
++  );
++}
++
+ // Простая рисовалка
+ function DrawingCanvas({ onSave, onCancel }) {
+   const canvasRef = useRef(null);
+@@ -109,6 +127,7 @@ function DrawingCanvas({ onSave, onCancel }) {
+ 
+ export default function App() {
+   const [me, setMe] = useState(null);
++  const [lightboxSrc, setLightboxSrc] = useState(null);
+   const [screen, setScreen] = useState('feed');
+   const [authMode, setAuthMode] = useState('login');
+ 
+@@ -472,7 +491,7 @@ export default function App() {
+                   (p.media_url.match(/\.(mp4|webm|mov)$/i) ? (
+                     <video src={p.media_url} controls className="post-media" />
+                   ) : (
+-                    <img src={p.media_url} className="post-media" alt="" />
++                    <img src={p.media_url} className="post-media zoomable" alt="" onClick={() => setLightboxSrc(p.media_url)} />
+                   ))}
+               </article>
+             ))}
+@@ -515,7 +534,7 @@ export default function App() {
+                           (m.media_url.match(/\.(mp4|webm|mov)$/i) ? (
+                             <video src={m.media_url} controls className="chat-media" />
+                           ) : (
+-                            <img src={m.media_url} className="chat-media" alt="" />
++                            <img src={m.media_url} className="chat-media zoomable" alt="" onClick={() => setLightboxSrc(m.media_url)} />
+                           ))}
+                       </div>
+                     ))}
+@@ -626,6 +645,8 @@ export default function App() {
+         )}
+       </main>
+ 
++      {lightboxSrc && <Lightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
++
+       {/* Post modal */}
+       {showPostModal && (
+         <div className="modal-overlay" onClick={() => setShowPostModal(false)}>
+diff --git a/frontend/src/styles.css b/frontend/src/styles.css
+index 0e35042..9074124 100644
+--- a/frontend/src/styles.css
++++ b/frontend/src/styles.css
+@@ -398,7 +398,9 @@ body {
+ }
+ 
+ .chat-media {
+-  max-width: 200px;
++  max-width: 280px;
++  max-height: 320px;
++  object-fit: cover;
+   border-radius: 8px;
+   margin-top: 6px;
+   display: block;
+@@ -849,4 +851,24 @@ body {
+   color: #0d0d12;
+   font-weight: 700;
+   cursor: pointer;
+-}
+\ No newline at end of file
++}
++/* ---------- Lightbox ---------- */
++.zoomable { cursor: zoom-in; }
++.lightbox {
++  position: fixed; inset: 0; z-index: 1000;
++  background: rgba(0,0,0,0.92);
++  display: flex; align-items: center; justify-content: center;
++  cursor: zoom-out;
++}
++.lightbox img {
++  max-width: 95vw; max-height: 90vh; object-fit: contain;
++  border-radius: 6px; cursor: default;
++}
++.lightbox-close {
++  position: absolute; top: 16px; right: 20px;
++  background: none; border: none; color: #fff; font-size: 28px; cursor: pointer;
++}
++.lightbox-open {
++  position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
++  color: #c9a84c; font-size: 13px; text-decoration: none;
++}
