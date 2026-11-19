@@ -1,0 +1,54 @@
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..85883b5
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,3 @@
++# cp .env.example .env  и впиши свои значения
++ADMIN_PASSWORD=придумай-пароль
++JWT_SECRET=длинная-случайная-строка
+diff --git a/.gitignore b/.gitignore
+index 22d54ca..c9163f9 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,2 @@
+-/backend/uploads/*
+\ No newline at end of file
++/backend/uploads/*
++.env
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 56036e4..93eec30 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -24,8 +24,8 @@ services:
+       DB_PASSWORD: rewardpass
+       DB_NAME: reward
+       ADMIN_USER: admin
+-      ADMIN_PASSWORD: admin   # поменяй перед выкладкой в интернет
+-      # JWT_SECRET: <длинная случайная строка>
++      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
++      JWT_SECRET: ${JWT_SECRET:-experiment-reward-secret-change-me}
+     volumes:
+       - ./backend/uploads:/app/uploads
+     depends_on:
+@@ -36,7 +36,7 @@ services:
+     build: ./frontend
+     restart: unless-stopped
+     ports:
+-      - "5173:80"
++      - "80:80"
+     depends_on:
+       - backend
+ 
+diff --git a/frontend/nginx.conf b/frontend/nginx.conf
+index 66ced1d..cc65f47 100644
+--- a/frontend/nginx.conf
++++ b/frontend/nginx.conf
+@@ -14,6 +14,7 @@ server {
+         proxy_pass http://backend:3000/api/;
+         proxy_set_header Host $host;
+         proxy_set_header X-Real-IP $remote_addr;
++        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+     }
+ 
+     location /uploads/ {

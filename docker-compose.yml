@@ -24,8 +24,8 @@ services:
       DB_PASSWORD: rewardpass
       DB_NAME: reward
       ADMIN_USER: admin
-      ADMIN_PASSWORD: admin   # поменяй перед выкладкой в интернет
-      # JWT_SECRET: <длинная случайная строка>
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
+      JWT_SECRET: ${JWT_SECRET:-experiment-reward-secret-change-me}
     volumes:
       - ./backend/uploads:/app/uploads
     depends_on:
@@ -36,7 +36,7 @@ services:
     build: ./frontend
     restart: unless-stopped
     ports:
-      - "5173:80"
+      - "80:80"
     depends_on:
       - backend
 
