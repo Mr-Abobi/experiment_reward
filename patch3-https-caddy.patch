@@ -1,0 +1,66 @@
+diff --git a/.env.example b/.env.example
+index 85883b5..dea49ad 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,3 +1,5 @@
+ # cp .env.example .env  и впиши свои значения
+ ADMIN_PASSWORD=придумай-пароль
+ JWT_SECRET=длинная-случайная-строка
++# IP сервера или домен. Нужен для HTTPS
++SITE_ADDRESS=95.213.248.247
+diff --git a/Caddyfile b/Caddyfile
+new file mode 100644
+index 0000000..43334ce
+--- /dev/null
++++ b/Caddyfile
+@@ -0,0 +1,14 @@
++{
++	# Let's Encrypt выдаёт сертификаты на IP-адреса только по профилю shortlived (6 дней, продлевается сам)
++	cert_issuer acme {
++		profile shortlived
++	}
++}
++
++{$SITE_ADDRESS} {
++	encode gzip
++	request_body {
++		max_size 55MB
++	}
++	reverse_proxy frontend:80
++}
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 93eec30..908338c 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -35,10 +35,27 @@ services:
+   frontend:
+     build: ./frontend
+     restart: unless-stopped
++    depends_on:
++      - backend
++
++  # HTTPS-прокси: сам получает и продлевает сертификат Let's Encrypt (для IP или домена)
++  caddy:
++    image: caddy:2
++    restart: unless-stopped
++    environment:
++      SITE_ADDRESS: ${SITE_ADDRESS:?впиши SITE_ADDRESS (IP или домен) в файл .env}
+     ports:
+       - "80:80"
++      - "443:443"
++      - "443:443/udp"
++    volumes:
++      - ./Caddyfile:/etc/caddy/Caddyfile:ro
++      - caddy_data:/data
++      - caddy_config:/config
+     depends_on:
+-      - backend
++      - frontend
+ 
+ volumes:
+-  pgdata:
+\ No newline at end of file
++  pgdata:
++  caddy_data:
++  caddy_config:
+\ No newline at end of file

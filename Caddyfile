@@ -1,0 +1,14 @@
+{
+	# Let's Encrypt выдаёт сертификаты на IP-адреса только по профилю shortlived (6 дней, продлевается сам)
+	cert_issuer acme {
+		profile shortlived
+	}
+}
+
+{$SITE_ADDRESS} {
+	encode gzip
+	request_body {
+		max_size 55MB
+	}
+	reverse_proxy frontend:80
+}
