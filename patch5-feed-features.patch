@@ -1,0 +1,636 @@
+diff --git a/backend/index.js b/backend/index.js
+index 9d924e0..2520b32 100644
+--- a/backend/index.js
++++ b/backend/index.js
+@@ -47,6 +47,48 @@ function authMiddleware(req, res, next) {
+   }
+ }
+ 
++// Токен необязателен: если он есть — знаем, кто смотрит (нужно для «моя реакция»)
++function optionalAuth(req, res, next) {
++  const header = req.headers.authorization;
++  if (header) {
++    try { req.user = jwt.verify(header.replace('Bearer ', ''), JWT_SECRET); } catch { /* гость */ }
++  }
++  next();
++}
++
++// Обёртка для async-хендлеров: ошибка БД = 500, а не зависший запрос
++const h = (fn) => (req, res, next) =>
++  Promise.resolve(fn(req, res, next)).catch((e) => {
++    console.error(e);
++    res.status(500).json({ error: 'server error' });
++  });
++
++const isId = (v) => /^\d{1,9}$/.test(String(v));
++
++const REACTIONS = ['👍', '❤️', '😂', '🔥', '😮', '😢'];
++
++// Только ДОБАВЛЯЕТ таблицы (IF NOT EXISTS) — существующие данные не затрагиваются
++async function ensureSchema() {
++  await pool.query(`
++    CREATE TABLE IF NOT EXISTS comments (
++      id SERIAL PRIMARY KEY,
++      post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
++      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++      content TEXT NOT NULL,
++      created_at TIMESTAMP DEFAULT NOW()
++    );
++    CREATE INDEX IF NOT EXISTS comments_post_idx ON comments(post_id);
++    CREATE TABLE IF NOT EXISTS post_reactions (
++      post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
++      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++      emoji VARCHAR(16) NOT NULL,
++      created_at TIMESTAMP DEFAULT NOW(),
++      PRIMARY KEY (post_id, user_id)
++    );
++  `);
++  console.log('schema ok');
++}
++
+ function adminMiddleware(req, res, next) {
+   if (!req.user?.is_admin) return res.status(403).json({ error: 'no admin' });
+   next();
+@@ -123,14 +165,109 @@ app.post('/api/posts', authMiddleware, upload.single('media'), async (req, res)
+   res.json(r.rows[0]);
+ });
+ 
+-app.get('/api/posts', async (req, res) => {
++const POST_SORTS = {
++  new: 's.created_at DESC, s.id DESC',
++  old: 's.created_at ASC, s.id ASC',
++  popular: '(s.reactions_total + s.comments_count) DESC, s.created_at DESC, s.id DESC',
++};
++
++// ?sort=new (по умолчанию) | old | popular (реакции + комментарии)
++app.get('/api/posts', optionalAuth, h(async (req, res) => {
++  const order = POST_SORTS[req.query.sort] || POST_SORTS.new; // только из белого списка
+   const r = await pool.query(`
+-    SELECT p.*, u.username FROM posts p
+-    JOIN users u ON u.id = p.user_id
+-    ORDER BY p.created_at DESC LIMIT 50
+-  `);
++    SELECT * FROM (
++      SELECT p.*, u.username,
++        (SELECT COUNT(*)::int FROM post_reactions pr WHERE pr.post_id = p.id) AS reactions_total,
++        (SELECT COUNT(*)::int FROM comments c WHERE c.post_id = p.id) AS comments_count,
++        (SELECT COALESCE(json_object_agg(t.emoji, t.n), '{}'::json) FROM (
++           SELECT emoji, COUNT(*)::int AS n FROM post_reactions WHERE post_id = p.id GROUP BY emoji
++         ) t) AS reactions,
++        (SELECT emoji FROM post_reactions WHERE post_id = p.id AND user_id = $1::int) AS my_reaction
++      FROM posts p
++      JOIN users u ON u.id = p.user_id
++    ) s
++    ORDER BY ${order}
++    LIMIT 200
++  `, [req.user?.id || null]);
+   res.json(r.rows);
+-});
++}));
++
++// ---------- REACTIONS ----------
++// Одна реакция на пост от пользователя. Тот же эмодзи ещё раз — снять, другой — заменить.
++app.put('/api/posts/:id/reaction', authMiddleware, h(async (req, res) => {
++  const { id } = req.params;
++  const { emoji } = req.body;
++  if (!isId(id)) return res.status(400).json({ error: 'bad id' });
++  if (emoji && !REACTIONS.includes(emoji)) return res.status(400).json({ error: 'bad emoji' });
++
++  const post = await pool.query('SELECT 1 FROM posts WHERE id=$1', [id]);
++  if (!post.rows.length) return res.status(404).json({ error: 'post not found' });
++
++  const cur = await pool.query('SELECT emoji FROM post_reactions WHERE post_id=$1 AND user_id=$2', [id, req.user.id]);
++  if (!emoji || cur.rows[0]?.emoji === emoji) {
++    await pool.query('DELETE FROM post_reactions WHERE post_id=$1 AND user_id=$2', [id, req.user.id]);
++  } else {
++    await pool.query(
++      `INSERT INTO post_reactions (post_id, user_id, emoji) VALUES ($1,$2,$3)
++       ON CONFLICT (post_id, user_id) DO UPDATE SET emoji = EXCLUDED.emoji`,
++      [id, req.user.id, emoji]
++    );
++  }
++
++  const counts = await pool.query(
++    'SELECT emoji, COUNT(*)::int AS n FROM post_reactions WHERE post_id=$1 GROUP BY emoji', [id]
++  );
++  const reactions = {};
++  let total = 0;
++  for (const row of counts.rows) { reactions[row.emoji] = row.n; total += row.n; }
++  const mine = await pool.query('SELECT emoji FROM post_reactions WHERE post_id=$1 AND user_id=$2', [id, req.user.id]);
++  res.json({ reactions, reactions_total: total, my_reaction: mine.rows[0]?.emoji || null });
++}));
++
++// ---------- COMMENTS ----------
++app.get('/api/posts/:id/comments', h(async (req, res) => {
++  if (!isId(req.params.id)) return res.status(400).json({ error: 'bad id' });
++  const r = await pool.query(
++    `SELECT c.id, c.post_id, c.user_id, c.content, c.created_at, u.username
++     FROM comments c JOIN users u ON u.id = c.user_id
++     WHERE c.post_id = $1 ORDER BY c.created_at ASC, c.id ASC LIMIT 500`,
++    [req.params.id]
++  );
++  res.json(r.rows);
++}));
++
++app.post('/api/posts/:id/comments', authMiddleware, h(async (req, res) => {
++  const { id } = req.params;
++  const content = String(req.body.content || '').trim();
++  if (!isId(id)) return res.status(400).json({ error: 'bad id' });
++  if (!content || content.length > 1000) return res.status(400).json({ error: 'bad content' });
++
++  const post = await pool.query('SELECT 1 FROM posts WHERE id=$1', [id]);
++  if (!post.rows.length) return res.status(404).json({ error: 'post not found' });
++
++  const ins = await pool.query(
++    'INSERT INTO comments (post_id, user_id, content) VALUES ($1,$2,$3) RETURNING id',
++    [id, req.user.id, content]
++  );
++  const r = await pool.query(
++    `SELECT c.id, c.post_id, c.user_id, c.content, c.created_at, u.username
++     FROM comments c JOIN users u ON u.id = c.user_id WHERE c.id = $1`,
++    [ins.rows[0].id]
++  );
++  res.json(r.rows[0]);
++}));
++
++// Удалить может автор комментария или админ
++app.delete('/api/comments/:id', authMiddleware, h(async (req, res) => {
++  if (!isId(req.params.id)) return res.status(400).json({ error: 'bad id' });
++  const c = await pool.query('SELECT user_id FROM comments WHERE id=$1', [req.params.id]);
++  if (!c.rows.length) return res.status(404).json({ error: 'not found' });
++  if (c.rows[0].user_id !== req.user.id && !req.user.is_admin) {
++    return res.status(403).json({ error: 'forbidden' });
++  }
++  await pool.query('DELETE FROM comments WHERE id=$1', [req.params.id]);
++  res.json({ ok: true });
++}));
+ 
+ // ---------- MESSAGES ----------
+ app.post('/api/messages', authMiddleware, upload.single('media'), async (req, res) => {
+@@ -284,6 +421,14 @@ app.get('/api/frames/:frameId/results', async (req, res) => {
+   res.json(r.rows);
+ });
+ 
++// Удалить номинацию целиком (варианты, голоса и выданные рамки удалятся каскадом)
++app.delete('/api/frames/:frameId', authMiddleware, adminMiddleware, h(async (req, res) => {
++  if (!isId(req.params.frameId)) return res.status(400).json({ error: 'bad id' });
++  const r = await pool.query('DELETE FROM frames WHERE id=$1 RETURNING id', [req.params.frameId]);
++  if (!r.rows.length) return res.status(404).json({ error: 'not found' });
++  res.json({ ok: true });
++}));
++
+ // Дублировать рамку
+ app.post('/api/frames/:frameId/duplicate', authMiddleware, adminMiddleware, async (req, res) => {
+   const { frameId } = req.params;
+@@ -325,6 +470,8 @@ app.get('/api/me', authMiddleware, async (req, res) => {
+   res.json({ id: req.user.id, username: req.user.username, is_admin: req.user.is_admin });
+ });
+ 
+-ensureAdmin()
+-  .catch((e) => console.error('ensureAdmin failed (старая схема БД? сделай docker compose down -v):', e.message))
+-  .finally(() => app.listen(3000, () => console.log('backend up on :3000')));
++(async () => {
++  try { await ensureSchema(); } catch (e) { console.error('ensureSchema failed:', e.message); }
++  try { await ensureAdmin(); } catch (e) { console.error('ensureAdmin failed (старая схема БД? сделай docker compose down -v):', e.message); }
++  app.listen(3000, () => console.log('backend up on :3000'));
++})();
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 55fb50d..3bf1a58 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -125,9 +125,164 @@ function DrawingCanvas({ onSave, onCancel }) {
+   );
+ }
+ 
++const REACTIONS = ['👍', '❤️', '😂', '🔥', '😮', '😢'];
++
++const SORTS = [
++  { id: 'popular', label: '🔥 Популярные' },
++  { id: 'new', label: '🆕 Новые' },
++  { id: 'old', label: '🕰 Старые' },
++];
++
++function formatTime(iso) {
++  return new Date(iso).toLocaleString('ru-RU', {
++    day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
++  });
++}
++
++// Один пост: реакции + комментарии (комментарии подгружаются при открытии)
++function PostCard({ post, me, frames, onZoom, onNeedAuth, onUpdate }) {
++  const [showComments, setShowComments] = useState(false);
++  const [comments, setComments] = useState(null);
++  const [draft, setDraft] = useState('');
++  const [busy, setBusy] = useState(false);
++
++  const loadComments = async () => {
++    try {
++      const r = await api.get(`/posts/${post.id}/comments`);
++      setComments(r.data);
++    } catch {
++      setComments([]);
++    }
++  };
++
++  const toggleComments = () => {
++    const next = !showComments;
++    setShowComments(next);
++    if (next && comments === null) loadComments();
++  };
++
++  const react = async (emoji) => {
++    if (!me) return onNeedAuth();
++    try {
++      const r = await api.put(`/posts/${post.id}/reaction`, { emoji });
++      onUpdate({ ...post, ...r.data });
++    } catch {
++      alert('Не удалось поставить реакцию');
++    }
++  };
++
++  const sendComment = async (e) => {
++    e.preventDefault();
++    const text = draft.trim();
++    if (!text || busy) return;
++    setBusy(true);
++    try {
++      const r = await api.post(`/posts/${post.id}/comments`, { content: text });
++      setComments((prev) => [...(prev || []), r.data]);
++      onUpdate({ ...post, comments_count: post.comments_count + 1 });
++      setDraft('');
++    } catch {
++      alert('Не удалось отправить комментарий');
++    }
++    setBusy(false);
++  };
++
++  const removeComment = async (c) => {
++    if (!window.confirm('Удалить комментарий?')) return;
++    try {
++      await api.delete(`/comments/${c.id}`);
++      setComments((prev) => prev.filter((x) => x.id !== c.id));
++      onUpdate({ ...post, comments_count: Math.max(0, post.comments_count - 1) });
++    } catch {
++      alert('Не удалось удалить');
++    }
++  };
++
++  return (
++    <article className="post">
++      <div className="post-head">
++        <b>{post.username}</b>
++        <div className="frames">
++          {(frames || []).map((f) => (
++            <div key={f.id} className="frame-wrapper" title={f.caption || f.name}>
++              <img src={f.image_url} alt={f.name} className="frame-img" />
++            </div>
++          ))}
++        </div>
++      </div>
++      <p>{post.content}</p>
++      {post.media_url &&
++        (post.media_url.match(/\.(mp4|webm|mov)$/i) ? (
++          <video src={post.media_url} controls className="post-media" />
++        ) : (
++          <img src={post.media_url} className="post-media zoomable" alt="" onClick={() => onZoom(post.media_url)} />
++        ))}
++
++      <div className="post-actions">
++        <div className="react-bar">
++          {REACTIONS.map((emoji) => {
++            const n = post.reactions?.[emoji] || 0;
++            return (
++              <button
++                key={emoji}
++                type="button"
++                className={'react-btn' + (post.my_reaction === emoji ? ' active' : '')}
++                onClick={() => react(emoji)}
++                title={me ? '' : 'Войди, чтобы ставить реакции'}
++              >
++                {emoji}
++                {n > 0 && <span>{n}</span>}
++              </button>
++            );
++          })}
++        </div>
++        <button type="button" className={'comments-toggle' + (showComments ? ' active' : '')} onClick={toggleComments}>
++          💬 {post.comments_count > 0 ? post.comments_count : 'Комментировать'}
++        </button>
++      </div>
++
++      {showComments && (
++        <div className="comments">
++          {comments === null && <div className="muted">Загрузка…</div>}
++          {comments?.length === 0 && <div className="muted">Комментариев пока нет</div>}
++          {comments?.map((c) => (
++            <div key={c.id} className="comment">
++              <div className="comment-head">
++                <b>{c.username}</b>
++                <span className="muted">{formatTime(c.created_at)}</span>
++                {me && (me.id === c.user_id || me.is_admin) && (
++                  <button type="button" className="comment-del" onClick={() => removeComment(c)} title="Удалить">✕</button>
++                )}
++              </div>
++              <div className="comment-text">{c.content}</div>
++            </div>
++          ))}
++          {me ? (
++            <form className="comment-form" onSubmit={sendComment}>
++              <input
++                value={draft}
++                maxLength={1000}
++                placeholder="Написать комментарий…"
++                onChange={(e) => setDraft(e.target.value)}
++              />
++              <button type="submit" className="btn-primary" disabled={busy || !draft.trim()}>→</button>
++            </form>
++          ) : (
++            <div className="muted">
++              <span className="link" onClick={onNeedAuth}>Войди</span>, чтобы комментировать
++            </div>
++          )}
++        </div>
++      )}
++    </article>
++  );
++}
++
+ export default function App() {
+   const [me, setMe] = useState(null);
+   const [lightboxSrc, setLightboxSrc] = useState(null);
++  const [feedSort, setFeedSort] = useState('new'); // по умолчанию — сначала новые
++  const sortRef = useRef('new');
+   const [screen, setScreen] = useState('feed');
+   const [authMode, setAuthMode] = useState('login');
+ 
+@@ -170,7 +325,7 @@ export default function App() {
+   const loadAll = useCallback(async () => {
+     try {
+       const [p, u, f] = await Promise.all([
+-        api.get('/posts'),
++        api.get('/posts', { params: { sort: sortRef.current } }),
+         api.get('/users'),
+         api.get('/frames'),
+       ]);
+@@ -405,6 +560,18 @@ export default function App() {
+     );
+   }
+ 
++  const changeSort = async (id) => {
++    if (id === sortRef.current) return;
++    sortRef.current = id;
++    setFeedSort(id);
++    try {
++      const r = await api.get('/posts', { params: { sort: id } });
++      setPosts(r.data);
++    } catch {
++      /* оставляем текущую ленту */
++    }
++  };
++
+   // ---------- MAIN ----------
+   return (
+     <div className="app">
+@@ -429,6 +596,27 @@ export default function App() {
+             <button onClick={() => setShowAdmin(!showAdmin)}>⚙️ Админка</button>
+           )}
+         </nav>
++
++        {!me && (
++          <div className="promo-card">
++            <div className="promo-emoji">🎭</div>
++            <h4>Хочешь постить рофлянчики?</h4>
++            <p>Зарегистрируйся: посты, реакции, комментарии и голосование за награды ждут тебя.</p>
++            <button
++              className="btn-primary"
++              onClick={() => {
++                setAuthMode('register');
++                setScreen('auth');
++              }}
++            >
++              Зарегистрироваться
++            </button>
++            <div className="promo-sub" onClick={() => { setAuthMode('login'); setScreen('auth'); }}>
++              Уже есть аккаунт? Войти
++            </div>
++          </div>
++        )}
++
+         <div className="sidebar-bottom">
+           {me ? (
+             <>
+@@ -458,6 +646,19 @@ export default function App() {
+               )}
+             </div>
+ 
++            <div className="sort-bar">
++              {SORTS.map((o) => (
++                <button
++                  key={o.id}
++                  type="button"
++                  className={feedSort === o.id ? 'active' : ''}
++                  onClick={() => changeSort(o.id)}
++                >
++                  {o.label}
++                </button>
++              ))}
++            </div>
++
+             {!me && (
+               <div className="empty-state">
+                 <h3>Тут пока пусто</h3>
+@@ -475,25 +676,15 @@ export default function App() {
+             )}
+ 
+             {posts.map((p) => (
+-              <article key={p.id} className="post">
+-                <div className="post-head">
+-                  <b>{p.username}</b>
+-                  <div className="frames">
+-                    {(userFrames[p.user_id] || []).map((f) => (
+-                      <div key={f.id} className="frame-wrapper" title={f.caption || f.name}>
+-                        <img src={f.image_url} alt={f.name} className="frame-img" />
+-                      </div>
+-                    ))}
+-                  </div>
+-                </div>
+-                <p>{p.content}</p>
+-                {p.media_url &&
+-                  (p.media_url.match(/\.(mp4|webm|mov)$/i) ? (
+-                    <video src={p.media_url} controls className="post-media" />
+-                  ) : (
+-                    <img src={p.media_url} className="post-media zoomable" alt="" onClick={() => setLightboxSrc(p.media_url)} />
+-                  ))}
+-              </article>
++              <PostCard
++                key={p.id}
++                post={p}
++                me={me}
++                frames={userFrames[p.user_id]}
++                onZoom={setLightboxSrc}
++                onNeedAuth={() => setScreen('auth')}
++                onUpdate={(np) => setPosts((ps) => ps.map((x) => (x.id === np.id ? np : x)))}
++              />
+             ))}
+           </div>
+         )}
+@@ -717,6 +908,20 @@ export default function App() {
+                 >
+                   Дублировать
+                 </button>
++                <button
++                  className="danger-btn"
++                  onClick={async () => {
++                    if (!window.confirm(`Удалить номинацию «${f.name}»?\nВместе с ней удалятся все варианты, голоса и выданные рамки.`)) return;
++                    try {
++                      await api.delete(`/frames/${f.id}`);
++                      loadAll();
++                    } catch {
++                      alert('Не удалось удалить номинацию');
++                    }
++                  }}
++                >
++                  Удалить
++                </button>
+               </div>
+ 
+               {(frameOptions[f.id] || []).map((o) => (
+diff --git a/frontend/src/styles.css b/frontend/src/styles.css
+index 9074124..66c3a22 100644
+--- a/frontend/src/styles.css
++++ b/frontend/src/styles.css
+@@ -872,3 +872,134 @@ body {
+   position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
+   color: #c9a84c; font-size: 13px; text-decoration: none;
+ }
++
++/* ---------- Promo card (гости) ---------- */
++.promo-card {
++  margin: 12px 0;
++  padding: 16px 14px;
++  border-radius: 14px;
++  text-align: center;
++  background: linear-gradient(160deg, rgba(201, 168, 76, 0.16), rgba(201, 168, 76, 0.04) 60%);
++  border: 1px solid rgba(201, 168, 76, 0.45);
++  box-shadow: 0 0 24px rgba(201, 168, 76, 0.12);
++}
++.promo-emoji { font-size: 30px; margin-bottom: 6px; }
++.promo-card h4 { margin: 0 0 6px; font-size: 15px; color: #e8e8f0; }
++.promo-card p { margin: 0 0 12px; font-size: 12.5px; line-height: 1.45; color: #a0a0b8; }
++.promo-card .btn-primary { width: 100%; padding: 10px 12px; }
++.promo-sub { margin-top: 10px; font-size: 12px; color: #6b6b80; cursor: pointer; }
++.promo-sub:hover { color: #c9a84c; }
++
++/* ---------- Sorting ---------- */
++.sort-bar {
++  display: flex;
++  gap: 6px;
++  margin-bottom: 16px;
++  flex-wrap: wrap;
++}
++.sort-bar button {
++  background: #16161f;
++  border: 1px solid #2a2a3a;
++  color: #a0a0b8;
++  padding: 7px 14px;
++  border-radius: 20px;
++  font-size: 13px;
++  cursor: pointer;
++  transition: all 0.15s;
++}
++.sort-bar button:hover { border-color: #c9a84c; color: #e8e8f0; }
++.sort-bar button.active {
++  background: rgba(201, 168, 76, 0.15);
++  border-color: #c9a84c;
++  color: #c9a84c;
++  font-weight: 600;
++}
++
++/* ---------- Reactions & comments ---------- */
++.post-actions {
++  display: flex;
++  justify-content: space-between;
++  align-items: center;
++  gap: 8px;
++  flex-wrap: wrap;
++  margin-top: 12px;
++  padding-top: 10px;
++  border-top: 1px solid #1f1f2e;
++}
++.react-bar { display: flex; gap: 4px; flex-wrap: wrap; }
++.react-btn {
++  display: inline-flex;
++  align-items: center;
++  gap: 4px;
++  background: #1c1c28;
++  border: 1px solid transparent;
++  color: #a0a0b8;
++  padding: 4px 9px;
++  border-radius: 16px;
++  font-size: 15px;
++  cursor: pointer;
++  transition: all 0.12s;
++}
++.react-btn span { font-size: 12px; font-weight: 600; }
++.react-btn:hover { background: #242434; transform: translateY(-1px); }
++.react-btn.active {
++  background: rgba(201, 168, 76, 0.16);
++  border-color: #c9a84c;
++  color: #c9a84c;
++}
++.comments-toggle {
++  background: none;
++  border: none;
++  color: #a0a0b8;
++  font-size: 13px;
++  cursor: pointer;
++  padding: 6px 8px;
++  border-radius: 8px;
++}
++.comments-toggle:hover, .comments-toggle.active { color: #c9a84c; background: #1c1c28; }
++
++.comments { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
++.comment {
++  background: #12121a;
++  border: 1px solid #1f1f2e;
++  border-radius: 10px;
++  padding: 8px 12px;
++}
++.comment-head { display: flex; align-items: center; gap: 8px; font-size: 13px; }
++.comment-head .muted { font-size: 11px; }
++.comment-del {
++  margin-left: auto;
++  background: none;
++  border: none;
++  color: #6b6b80;
++  cursor: pointer;
++  font-size: 12px;
++}
++.comment-del:hover { color: #e05561; }
++.comment-text { margin-top: 3px; font-size: 14px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
++.comment-form { display: flex; gap: 8px; }
++.comment-form input {
++  flex: 1;
++  background: #12121a;
++  border: 1px solid #2a2a3a;
++  border-radius: 10px;
++  padding: 9px 12px;
++  color: #e8e8f0;
++  font-size: 14px;
++}
++.comment-form input:focus { outline: none; border-color: #c9a84c; }
++.comment-form .btn-primary { padding: 9px 16px; }
++.comment-form .btn-primary:disabled { opacity: 0.4; cursor: default; }
++.link { color: #c9a84c; cursor: pointer; text-decoration: underline; }
++
++/* ---------- Admin: delete ---------- */
++.danger-btn {
++  background: none;
++  border: 1px solid #5a2a30;
++  color: #e05561;
++  padding: 6px 12px;
++  border-radius: 8px;
++  cursor: pointer;
++  font-size: 13px;
++}
++.danger-btn:hover { background: #e05561; color: #fff; }

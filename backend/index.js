@@ -47,6 +47,48 @@ function authMiddleware(req, res, next) {
   }
 }
 
+// Токен необязателен: если он есть — знаем, кто смотрит (нужно для «моя реакция»)
+function optionalAuth(req, res, next) {
+  const header = req.headers.authorization;
+  if (header) {
+    try { req.user = jwt.verify(header.replace('Bearer ', ''), JWT_SECRET); } catch { /* гость */ }
+  }
+  next();
+}
+
+// Обёртка для async-хендлеров: ошибка БД = 500, а не зависший запрос
+const h = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch((e) => {
+    console.error(e);
+    res.status(500).json({ error: 'server error' });
+  });
+
+const isId = (v) => /^\d{1,9}$/.test(String(v));
+
+const REACTIONS = ['👍', '❤️', '😂', '🔥', '😮', '😢'];
+
+// Только ДОБАВЛЯЕТ таблицы (IF NOT EXISTS) — существующие данные не затрагиваются
+async function ensureSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS comments (
+      id SERIAL PRIMARY KEY,
+      post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS comments_post_idx ON comments(post_id);
+    CREATE TABLE IF NOT EXISTS post_reactions (
+      post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      emoji VARCHAR(16) NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (post_id, user_id)
+    );
+  `);
+  console.log('schema ok');
+}
+
 function adminMiddleware(req, res, next) {
   if (!req.user?.is_admin) return res.status(403).json({ error: 'no admin' });
   next();
@@ -123,14 +165,109 @@ app.post('/api/posts', authMiddleware, upload.single('media'), async (req, res) 
   res.json(r.rows[0]);
 });
 
-app.get('/api/posts', async (req, res) => {
+const POST_SORTS = {
+  new: 's.created_at DESC, s.id DESC',
+  old: 's.created_at ASC, s.id ASC',
+  popular: '(s.reactions_total + s.comments_count) DESC, s.created_at DESC, s.id DESC',
+};
+
+// ?sort=new (по умолчанию) | old | popular (реакции + комментарии)
+app.get('/api/posts', optionalAuth, h(async (req, res) => {
+  const order = POST_SORTS[req.query.sort] || POST_SORTS.new; // только из белого списка
   const r = await pool.query(`
-    SELECT p.*, u.username FROM posts p
-    JOIN users u ON u.id = p.user_id
-    ORDER BY p.created_at DESC LIMIT 50
-  `);
+    SELECT * FROM (
+      SELECT p.*, u.username,
+        (SELECT COUNT(*)::int FROM post_reactions pr WHERE pr.post_id = p.id) AS reactions_total,
+        (SELECT COUNT(*)::int FROM comments c WHERE c.post_id = p.id) AS comments_count,
+        (SELECT COALESCE(json_object_agg(t.emoji, t.n), '{}'::json) FROM (
+           SELECT emoji, COUNT(*)::int AS n FROM post_reactions WHERE post_id = p.id GROUP BY emoji
+         ) t) AS reactions,
+        (SELECT emoji FROM post_reactions WHERE post_id = p.id AND user_id = $1::int) AS my_reaction
+      FROM posts p
+      JOIN users u ON u.id = p.user_id
+    ) s
+    ORDER BY ${order}
+    LIMIT 200
+  `, [req.user?.id || null]);
   res.json(r.rows);
-});
+}));
+
+// ---------- REACTIONS ----------
+// Одна реакция на пост от пользователя. Тот же эмодзи ещё раз — снять, другой — заменить.
+app.put('/api/posts/:id/reaction', authMiddleware, h(async (req, res) => {
+  const { id } = req.params;
+  const { emoji } = req.body;
+  if (!isId(id)) return res.status(400).json({ error: 'bad id' });
+  if (emoji && !REACTIONS.includes(emoji)) return res.status(400).json({ error: 'bad emoji' });
+
+  const post = await pool.query('SELECT 1 FROM posts WHERE id=$1', [id]);
+  if (!post.rows.length) return res.status(404).json({ error: 'post not found' });
+
+  const cur = await pool.query('SELECT emoji FROM post_reactions WHERE post_id=$1 AND user_id=$2', [id, req.user.id]);
+  if (!emoji || cur.rows[0]?.emoji === emoji) {
+    await pool.query('DELETE FROM post_reactions WHERE post_id=$1 AND user_id=$2', [id, req.user.id]);
+  } else {
+    await pool.query(
+      `INSERT INTO post_reactions (post_id, user_id, emoji) VALUES ($1,$2,$3)
+       ON CONFLICT (post_id, user_id) DO UPDATE SET emoji = EXCLUDED.emoji`,
+      [id, req.user.id, emoji]
+    );
+  }
+
+  const counts = await pool.query(
+    'SELECT emoji, COUNT(*)::int AS n FROM post_reactions WHERE post_id=$1 GROUP BY emoji', [id]
+  );
+  const reactions = {};
+  let total = 0;
+  for (const row of counts.rows) { reactions[row.emoji] = row.n; total += row.n; }
+  const mine = await pool.query('SELECT emoji FROM post_reactions WHERE post_id=$1 AND user_id=$2', [id, req.user.id]);
+  res.json({ reactions, reactions_total: total, my_reaction: mine.rows[0]?.emoji || null });
+}));
+
+// ---------- COMMENTS ----------
+app.get('/api/posts/:id/comments', h(async (req, res) => {
+  if (!isId(req.params.id)) return res.status(400).json({ error: 'bad id' });
+  const r = await pool.query(
+    `SELECT c.id, c.post_id, c.user_id, c.content, c.created_at, u.username
+     FROM comments c JOIN users u ON u.id = c.user_id
+     WHERE c.post_id = $1 ORDER BY c.created_at ASC, c.id ASC LIMIT 500`,
+    [req.params.id]
+  );
+  res.json(r.rows);
+}));
+
+app.post('/api/posts/:id/comments', authMiddleware, h(async (req, res) => {
+  const { id } = req.params;
+  const content = String(req.body.content || '').trim();
+  if (!isId(id)) return res.status(400).json({ error: 'bad id' });
+  if (!content || content.length > 1000) return res.status(400).json({ error: 'bad content' });
+
+  const post = await pool.query('SELECT 1 FROM posts WHERE id=$1', [id]);
+  if (!post.rows.length) return res.status(404).json({ error: 'post not found' });
+
+  const ins = await pool.query(
+    'INSERT INTO comments (post_id, user_id, content) VALUES ($1,$2,$3) RETURNING id',
+    [id, req.user.id, content]
+  );
+  const r = await pool.query(
+    `SELECT c.id, c.post_id, c.user_id, c.content, c.created_at, u.username
+     FROM comments c JOIN users u ON u.id = c.user_id WHERE c.id = $1`,
+    [ins.rows[0].id]
+  );
+  res.json(r.rows[0]);
+}));
+
+// Удалить может автор комментария или админ
+app.delete('/api/comments/:id', authMiddleware, h(async (req, res) => {
+  if (!isId(req.params.id)) return res.status(400).json({ error: 'bad id' });
+  const c = await pool.query('SELECT user_id FROM comments WHERE id=$1', [req.params.id]);
+  if (!c.rows.length) return res.status(404).json({ error: 'not found' });
+  if (c.rows[0].user_id !== req.user.id && !req.user.is_admin) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  await pool.query('DELETE FROM comments WHERE id=$1', [req.params.id]);
+  res.json({ ok: true });
+}));
 
 // ---------- MESSAGES ----------
 app.post('/api/messages', authMiddleware, upload.single('media'), async (req, res) => {
@@ -284,6 +421,14 @@ app.get('/api/frames/:frameId/results', async (req, res) => {
   res.json(r.rows);
 });
 
+// Удалить номинацию целиком (варианты, голоса и выданные рамки удалятся каскадом)
+app.delete('/api/frames/:frameId', authMiddleware, adminMiddleware, h(async (req, res) => {
+  if (!isId(req.params.frameId)) return res.status(400).json({ error: 'bad id' });
+  const r = await pool.query('DELETE FROM frames WHERE id=$1 RETURNING id', [req.params.frameId]);
+  if (!r.rows.length) return res.status(404).json({ error: 'not found' });
+  res.json({ ok: true });
+}));
+
 // Дублировать рамку
 app.post('/api/frames/:frameId/duplicate', authMiddleware, adminMiddleware, async (req, res) => {
   const { frameId } = req.params;
@@ -325,6 +470,8 @@ app.get('/api/me', authMiddleware, async (req, res) => {
   res.json({ id: req.user.id, username: req.user.username, is_admin: req.user.is_admin });
 });
 
-ensureAdmin()
-  .catch((e) => console.error('ensureAdmin failed (старая схема БД? сделай docker compose down -v):', e.message))
-  .finally(() => app.listen(3000, () => console.log('backend up on :3000')));
+(async () => {
+  try { await ensureSchema(); } catch (e) { console.error('ensureSchema failed:', e.message); }
+  try { await ensureAdmin(); } catch (e) { console.error('ensureAdmin failed (старая схема БД? сделай docker compose down -v):', e.message); }
+  app.listen(3000, () => console.log('backend up on :3000'));
+})();

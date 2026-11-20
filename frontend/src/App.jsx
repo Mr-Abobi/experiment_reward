@@ -125,9 +125,164 @@ function DrawingCanvas({ onSave, onCancel }) {
   );
 }
 
+const REACTIONS = ['👍', '❤️', '😂', '🔥', '😮', '😢'];
+
+const SORTS = [
+  { id: 'popular', label: '🔥 Популярные' },
+  { id: 'new', label: '🆕 Новые' },
+  { id: 'old', label: '🕰 Старые' },
+];
+
+function formatTime(iso) {
+  return new Date(iso).toLocaleString('ru-RU', {
+    day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
+  });
+}
+
+// Один пост: реакции + комментарии (комментарии подгружаются при открытии)
+function PostCard({ post, me, frames, onZoom, onNeedAuth, onUpdate }) {
+  const [showComments, setShowComments] = useState(false);
+  const [comments, setComments] = useState(null);
+  const [draft, setDraft] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const loadComments = async () => {
+    try {
+      const r = await api.get(`/posts/${post.id}/comments`);
+      setComments(r.data);
+    } catch {
+      setComments([]);
+    }
+  };
+
+  const toggleComments = () => {
+    const next = !showComments;
+    setShowComments(next);
+    if (next && comments === null) loadComments();
+  };
+
+  const react = async (emoji) => {
+    if (!me) return onNeedAuth();
+    try {
+      const r = await api.put(`/posts/${post.id}/reaction`, { emoji });
+      onUpdate({ ...post, ...r.data });
+    } catch {
+      alert('Не удалось поставить реакцию');
+    }
+  };
+
+  const sendComment = async (e) => {
+    e.preventDefault();
+    const text = draft.trim();
+    if (!text || busy) return;
+    setBusy(true);
+    try {
+      const r = await api.post(`/posts/${post.id}/comments`, { content: text });
+      setComments((prev) => [...(prev || []), r.data]);
+      onUpdate({ ...post, comments_count: post.comments_count + 1 });
+      setDraft('');
+    } catch {
+      alert('Не удалось отправить комментарий');
+    }
+    setBusy(false);
+  };
+
+  const removeComment = async (c) => {
+    if (!window.confirm('Удалить комментарий?')) return;
+    try {
+      await api.delete(`/comments/${c.id}`);
+      setComments((prev) => prev.filter((x) => x.id !== c.id));
+      onUpdate({ ...post, comments_count: Math.max(0, post.comments_count - 1) });
+    } catch {
+      alert('Не удалось удалить');
+    }
+  };
+
+  return (
+    <article className="post">
+      <div className="post-head">
+        <b>{post.username}</b>
+        <div className="frames">
+          {(frames || []).map((f) => (
+            <div key={f.id} className="frame-wrapper" title={f.caption || f.name}>
+              <img src={f.image_url} alt={f.name} className="frame-img" />
+            </div>
+          ))}
+        </div>
+      </div>
+      <p>{post.content}</p>
+      {post.media_url &&
+        (post.media_url.match(/\.(mp4|webm|mov)$/i) ? (
+          <video src={post.media_url} controls className="post-media" />
+        ) : (
+          <img src={post.media_url} className="post-media zoomable" alt="" onClick={() => onZoom(post.media_url)} />
+        ))}
+
+      <div className="post-actions">
+        <div className="react-bar">
+          {REACTIONS.map((emoji) => {
+            const n = post.reactions?.[emoji] || 0;
+            return (
+              <button
+                key={emoji}
+                type="button"
+                className={'react-btn' + (post.my_reaction === emoji ? ' active' : '')}
+                onClick={() => react(emoji)}
+                title={me ? '' : 'Войди, чтобы ставить реакции'}
+              >
+                {emoji}
+                {n > 0 && <span>{n}</span>}
+              </button>
+            );
+          })}
+        </div>
+        <button type="button" className={'comments-toggle' + (showComments ? ' active' : '')} onClick={toggleComments}>
+          💬 {post.comments_count > 0 ? post.comments_count : 'Комментировать'}
+        </button>
+      </div>
+
+      {showComments && (
+        <div className="comments">
+          {comments === null && <div className="muted">Загрузка…</div>}
+          {comments?.length === 0 && <div className="muted">Комментариев пока нет</div>}
+          {comments?.map((c) => (
+            <div key={c.id} className="comment">
+              <div className="comment-head">
+                <b>{c.username}</b>
+                <span className="muted">{formatTime(c.created_at)}</span>
+                {me && (me.id === c.user_id || me.is_admin) && (
+                  <button type="button" className="comment-del" onClick={() => removeComment(c)} title="Удалить">✕</button>
+                )}
+              </div>
+              <div className="comment-text">{c.content}</div>
+            </div>
+          ))}
+          {me ? (
+            <form className="comment-form" onSubmit={sendComment}>
+              <input
+                value={draft}
+                maxLength={1000}
+                placeholder="Написать комментарий…"
+                onChange={(e) => setDraft(e.target.value)}
+              />
+              <button type="submit" className="btn-primary" disabled={busy || !draft.trim()}>→</button>
+            </form>
+          ) : (
+            <div className="muted">
+              <span className="link" onClick={onNeedAuth}>Войди</span>, чтобы комментировать
+            </div>
+          )}
+        </div>
+      )}
+    </article>
+  );
+}
+
 export default function App() {
   const [me, setMe] = useState(null);
   const [lightboxSrc, setLightboxSrc] = useState(null);
+  const [feedSort, setFeedSort] = useState('new'); // по умолчанию — сначала новые
+  const sortRef = useRef('new');
   const [screen, setScreen] = useState('feed');
   const [authMode, setAuthMode] = useState('login');
 
@@ -170,7 +325,7 @@ export default function App() {
   const loadAll = useCallback(async () => {
     try {
       const [p, u, f] = await Promise.all([
-        api.get('/posts'),
+        api.get('/posts', { params: { sort: sortRef.current } }),
         api.get('/users'),
         api.get('/frames'),
       ]);
@@ -405,6 +560,18 @@ export default function App() {
     );
   }
 
+  const changeSort = async (id) => {
+    if (id === sortRef.current) return;
+    sortRef.current = id;
+    setFeedSort(id);
+    try {
+      const r = await api.get('/posts', { params: { sort: id } });
+      setPosts(r.data);
+    } catch {
+      /* оставляем текущую ленту */
+    }
+  };
+
   // ---------- MAIN ----------
   return (
     <div className="app">
@@ -429,6 +596,27 @@ export default function App() {
             <button onClick={() => setShowAdmin(!showAdmin)}>⚙️ Админка</button>
           )}
         </nav>
+
+        {!me && (
+          <div className="promo-card">
+            <div className="promo-emoji">🎭</div>
+            <h4>Хочешь постить рофлянчики?</h4>
+            <p>Зарегистрируйся: посты, реакции, комментарии и голосование за награды ждут тебя.</p>
+            <button
+              className="btn-primary"
+              onClick={() => {
+                setAuthMode('register');
+                setScreen('auth');
+              }}
+            >
+              Зарегистрироваться
+            </button>
+            <div className="promo-sub" onClick={() => { setAuthMode('login'); setScreen('auth'); }}>
+              Уже есть аккаунт? Войти
+            </div>
+          </div>
+        )}
+
         <div className="sidebar-bottom">
           {me ? (
             <>
@@ -458,6 +646,19 @@ export default function App() {
               )}
             </div>
 
+            <div className="sort-bar">
+              {SORTS.map((o) => (
+                <button
+                  key={o.id}
+                  type="button"
+                  className={feedSort === o.id ? 'active' : ''}
+                  onClick={() => changeSort(o.id)}
+                >
+                  {o.label}
+                </button>
+              ))}
+            </div>
+
             {!me && (
               <div className="empty-state">
                 <h3>Тут пока пусто</h3>
@@ -475,25 +676,15 @@ export default function App() {
             )}
 
             {posts.map((p) => (
-              <article key={p.id} className="post">
-                <div className="post-head">
-                  <b>{p.username}</b>
-                  <div className="frames">
-                    {(userFrames[p.user_id] || []).map((f) => (
-                      <div key={f.id} className="frame-wrapper" title={f.caption || f.name}>
-                        <img src={f.image_url} alt={f.name} className="frame-img" />
-                      </div>
-                    ))}
-                  </div>
-                </div>
-                <p>{p.content}</p>
-                {p.media_url &&
-                  (p.media_url.match(/\.(mp4|webm|mov)$/i) ? (
-                    <video src={p.media_url} controls className="post-media" />
-                  ) : (
-                    <img src={p.media_url} className="post-media zoomable" alt="" onClick={() => setLightboxSrc(p.media_url)} />
-                  ))}
-              </article>
+              <PostCard
+                key={p.id}
+                post={p}
+                me={me}
+                frames={userFrames[p.user_id]}
+                onZoom={setLightboxSrc}
+                onNeedAuth={() => setScreen('auth')}
+                onUpdate={(np) => setPosts((ps) => ps.map((x) => (x.id === np.id ? np : x)))}
+              />
             ))}
           </div>
         )}
@@ -716,6 +907,20 @@ export default function App() {
                   }}
                 >
                   Дублировать
+                </button>
+                <button
+                  className="danger-btn"
+                  onClick={async () => {
+                    if (!window.confirm(`Удалить номинацию «${f.name}»?\nВместе с ней удалятся все варианты, голоса и выданные рамки.`)) return;
+                    try {
+                      await api.delete(`/frames/${f.id}`);
+                      loadAll();
+                    } catch {
+                      alert('Не удалось удалить номинацию');
+                    }
+                  }}
+                >
+                  Удалить
                 </button>
               </div>
 
